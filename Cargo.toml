@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 # openraft = "0.9"
 openraft = { path = "../openraft/openraft", features = ["serde", "type-alias"]}
-seqlog = "0.2"
+seqlog = {path="../seqlog"}
+# seqlog = "0.2"
 serde = "1.0.228"
 serde_json = "1.0.150"

@@ -1,8 +1,11 @@
 use std::io;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::thread;
 
 use openraft::alias::{LogIdOf, VoteOf};
+use openraft::entry::RaftEntry;
 use openraft::storage::{IOFlushed, RaftLogStorage};
 use openraft::{LogState, OptionalSend, OptionalSync, RaftLogReader, RaftTypeConfig};
 
@@ -14,6 +17,7 @@ where
     C::Entry: EntryCodec,
 {
     store: SeqLog,
+    ioflush_tx: SyncSender<IOFlushed<C>>,
     write_buf: Vec<u8>,
     write_pos: Vec<usize>,
     _p: PhantomData<C>,
@@ -29,21 +33,18 @@ where
 }
 
 pub trait EntryCodec: Sized + Send + OptionalSync + 'static {
-    type EncodeError: std::fmt::Debug;
-    type DecodeError: std::fmt::Debug + Send + Sync + 'static + std::error::Error;
+    type EncodeError;
+    type DecodeError: Send + Sync + 'static + std::error::Error;
 
     fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Self::EncodeError>;
 
     fn decode(data: &[u8]) -> Result<Self, Self::DecodeError>;
 }
 
-fn seq_log_err(from: Error) -> std::io::Error {
+fn seq_log_err(from: Error) -> io::Error {
     match from {
         Error::Io(err) => err,
-        Error::EntryTooLarge(_) | Error::SeqPurged(_, _) | Error::SeqNotReached(_, _) => {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, from)
-        }
-        _ => std::io::Error::new(std::io::ErrorKind::InvalidData, from),
+        _ => io::Error::new(io::ErrorKind::Other, from),
     }
 }
 
@@ -57,12 +58,12 @@ where
     >(
         &mut self,
         range: RB,
-    ) -> Result<Vec<<C as RaftTypeConfig>::Entry>, std::io::Error> {
+    ) -> Result<Vec<<C as RaftTypeConfig>::Entry>, io::Error> {
         let start = match range.start_bound() {
             std::ops::Bound::Included(index) => *index,
             std::ops::Bound::Excluded(index) => *index + 1,
             std::ops::Bound::Unbounded => {
-                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
             }
         };
         if self.inner.next_seq() != start {
@@ -82,7 +83,7 @@ where
                 break;
             };
             let entry = C::Entry::decode(buf)
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
             res.push(entry);
         }
         Ok(res)
@@ -90,7 +91,7 @@ where
 
     async fn read_vote(
         &mut self,
-    ) -> Result<Option<openraft::type_config::alias::VoteOf<C>>, std::io::Error> {
+    ) -> Result<Option<openraft::type_config::alias::VoteOf<C>>, io::Error> {
         todo!()
     }
 }
@@ -157,21 +158,35 @@ where
         self.write_pos.clear();
         self.write_pos.push(0);
 
+        // prepare
+        let mut first_index = 0;
         for entry in entries.into_iter() {
             let _ = entry.encode(&mut self.write_buf);
             self.write_pos.push(self.write_buf.len());
-        }
 
+            if first_index == 0 {
+                first_index = entry.index();
+            }
+        }
         let inputs: Vec<_> = self
             .write_pos
             .windows(2)
             .map(|i| &self.write_buf[i[0]..i[1]])
             .collect();
 
+        // check if the store is ready
+        if self.store.next_seq() == 0 {
+            self.store.reset(first_index).map_err(seq_log_err)?;
+        }
+
+        // append
         self.store.append(&inputs).unwrap();
 
-        self.store.sync().unwrap();
-        callback.io_completed(Ok(()));
+        // flush
+        self.ioflush_tx
+            .send(callback)
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+
         Ok(())
     }
 
@@ -205,8 +220,46 @@ where
     C: RaftTypeConfig,
     C::Entry: EntryCodec,
 {
-    pub fn create<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
-        SeqLog::create(path, start_seq).map_err(seq_log_err)?;
-        Ok(())
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
+        // store
+        let store = if std::fs::exists(&path)? {
+            SeqLog::open(path)
+        } else {
+            SeqLog::create(&path, 0)
+        }
+        .map_err(seq_log_err)?;
+
+        // syncer and channel
+        let (tx, rx) = sync_channel(1000);
+        let syncer = store.syncer().map_err(seq_log_err)?;
+        thread::spawn(|| background_ioflush(rx, syncer));
+
+        Ok(Self {
+            store,
+            ioflush_tx: tx,
+            write_buf: Vec::new(),
+            write_pos: Vec::new(),
+            _p: PhantomData::default(),
+        })
+    }
+}
+
+fn background_ioflush<C>(rx: Receiver<IOFlushed<C>>, mut syncer: SeqLogSyncer)
+where
+    C: RaftTypeConfig,
+{
+    while let Ok(mut iof) = rx.recv() {
+        // consume all pendings
+        loop {
+            match rx.try_recv() {
+                Ok(f) => iof = f,
+                Err(TryRecvError::Empty) => break,
+                Err(_) => return,
+            }
+        }
+
+        // then sync
+        let result = syncer.sync().map_err(seq_log_err);
+        iof.io_completed(result);
     }
 }
