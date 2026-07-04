@@ -1,6 +1,8 @@
+use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread;
 
@@ -18,9 +20,17 @@ where
     C::Entry: EntryCodec,
 {
     store: SeqLog,
+
+    // notify disk synchronization in background thread
     ioflush_tx: SyncSender<IOFlushed<C>>,
+
+    // buffer cache
     write_buf: Vec<u8>,
     write_pos: Vec<usize>,
+
+    // vote file in json
+    vote_path: PathBuf,
+
     _p: PhantomData<C>,
 }
 
@@ -31,6 +41,10 @@ where
     C::Entry: EntryCodec,
 {
     inner: SeqLogReader,
+
+    // vote file in json
+    vote_path: PathBuf,
+
     _p: PhantomData<C>,
 }
 
@@ -83,10 +97,14 @@ where
         Ok(res)
     }
 
-    async fn read_vote(
-        &mut self,
-    ) -> Result<Option<openraft::type_config::alias::VoteOf<C>>, io::Error> {
-        todo!()
+    async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error> {
+        if std::fs::exists(&self.vote_path)? {
+            let json_buf = std::fs::read(&self.vote_path)?;
+            let vote = serde_json::from_slice(&json_buf).map_err(new_other_err)?;
+            Ok(Some(vote))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -112,6 +130,7 @@ where
         let inner = self.store.reader(self.store.sync_seq(), true).unwrap();
         Reader {
             inner,
+            vote_path: self.vote_path.clone(),
             _p: PhantomData::default(),
         }
     }
@@ -122,7 +141,11 @@ where
     ///
     /// The vote must be persisted on disk before returning.
     async fn save_vote(&mut self, vote: &VoteOf<C>) -> Result<(), io::Error> {
-        todo!()
+        let json_value = serde_json::to_vec(vote).map_err(new_other_err)?;
+
+        let mut file = File::create(&self.vote_path)?;
+        file.write(&json_value)?;
+        file.sync_all()
     }
 
     /// Append log entries and call the `callback` once logs are persisted on disk.
@@ -223,13 +246,16 @@ where
     C::Entry: EntryCodec,
 {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
+        let path = path.as_ref();
+
         // store
-        let store = if std::fs::exists(&path)? {
-            SeqLog::open(path)
+        let store_dir = path.join("store");
+        let store = if std::fs::exists(&store_dir)? {
+            SeqLog::open(store_dir)
         } else {
             // Create one store with start-seq = 0.
             // We will reset the seq at `RaftLogStorage::append`.
-            SeqLog::create(&path, 0)
+            SeqLog::create(&store_dir, 0)
         }
         .map_err(seq_log_err)?;
 
@@ -244,6 +270,7 @@ where
             ioflush_tx: tx,
             write_buf: Vec::new(),
             write_pos: Vec::new(),
+            vote_path: path.join("VOTE"),
             _p: PhantomData::default(),
         })
     }
