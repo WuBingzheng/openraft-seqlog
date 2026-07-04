@@ -11,6 +11,7 @@ use openraft::{LogState, OptionalSend, OptionalSync, RaftLogReader, RaftTypeConf
 
 use seqlog::{Error, SeqLog, SeqLogReader, SeqLogSyncer};
 
+// The store.
 pub struct SeqLogStore<C>
 where
     C: RaftTypeConfig,
@@ -23,6 +24,7 @@ where
     _p: PhantomData<C>,
 }
 
+// The reader.
 pub struct Reader<C>
 where
     C: RaftTypeConfig,
@@ -41,13 +43,6 @@ pub trait EntryCodec: Sized + Send + OptionalSync + 'static {
     fn decode(data: &[u8]) -> Result<Self, Self::DecodeError>;
 }
 
-fn seq_log_err(from: Error) -> io::Error {
-    match from {
-        Error::Io(err) => err,
-        _ => io::Error::new(io::ErrorKind::Other, from),
-    }
-}
-
 impl<C> RaftLogReader<C> for Reader<C>
 where
     C: RaftTypeConfig,
@@ -63,7 +58,7 @@ where
             std::ops::Bound::Included(index) => *index,
             std::ops::Bound::Excluded(index) => *index + 1,
             std::ops::Bound::Unbounded => {
-                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+                return Err(new_other_err("unsupport unbounded start index"));
             }
         };
         if self.inner.next_seq() != start {
@@ -82,8 +77,7 @@ where
             let Some(buf) = self.inner.next().map_err(seq_log_err)? else {
                 break;
             };
-            let entry = C::Entry::decode(buf)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            let entry = C::Entry::decode(buf).map_err(new_other_err)?;
             res.push(entry);
         }
         Ok(res)
@@ -175,8 +169,16 @@ where
             .collect();
 
         // check if the store is ready
-        if self.store.next_seq() == 0 {
+        let next_seq = self.store.next_seq();
+        if next_seq == 0 {
             self.store.reset(first_index).map_err(seq_log_err)?;
+
+        // check the log index
+        } else if next_seq != first_index {
+            return Err(new_other_err(format!(
+                "expect log index {} but got {}",
+                next_seq, first_index
+            )));
         }
 
         // append
@@ -225,6 +227,8 @@ where
         let store = if std::fs::exists(&path)? {
             SeqLog::open(path)
         } else {
+            // Create one store with start-seq = 0.
+            // We will reset the seq at `RaftLogStorage::append`.
             SeqLog::create(&path, 0)
         }
         .map_err(seq_log_err)?;
@@ -234,6 +238,7 @@ where
         let syncer = store.syncer().map_err(seq_log_err)?;
         thread::spawn(|| background_ioflush(rx, syncer));
 
+        // ok
         Ok(Self {
             store,
             ioflush_tx: tx,
@@ -244,6 +249,7 @@ where
     }
 }
 
+// disk synchronization background thread routine
 fn background_ioflush<C>(rx: Receiver<IOFlushed<C>>, mut syncer: SeqLogSyncer)
 where
     C: RaftTypeConfig,
@@ -260,6 +266,24 @@ where
 
         // then sync
         let result = syncer.sync().map_err(seq_log_err);
+
+        // call the last IoFlushed only
         iof.io_completed(result);
     }
+}
+
+// error type conversion
+fn seq_log_err(from: Error) -> io::Error {
+    match from {
+        Error::Io(err) => err,
+        _ => io::Error::new(io::ErrorKind::Other, from),
+    }
+}
+
+// new Error with std::io::ErrorKind::Other
+fn new_other_err<E>(err: E) -> io::Error
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    io::Error::new(io::ErrorKind::Other, err)
 }
