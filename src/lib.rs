@@ -31,6 +31,9 @@ where
     // vote file in json
     vote_path: PathBuf,
 
+    // last purged log id file in json
+    purged_log_id_path: PathBuf,
+
     _p: PhantomData<C>,
 }
 
@@ -123,7 +126,36 @@ where
     // NOTE: This can be made into sync, provided all state machines will use atomic read or the
     // like.
     async fn get_log_state(&mut self) -> Result<LogState<C>, io::Error> {
-        todo!()
+        // last_purged_log_id
+        let last_purged_log_id = if std::fs::exists(&self.purged_log_id_path)? {
+            let json_buf = std::fs::read(&self.purged_log_id_path)?;
+            let vote = serde_json::from_slice(&json_buf).map_err(new_other_err)?;
+            Some(vote)
+        } else {
+            None
+        };
+
+        // last_log_id
+        let next_seq = self.store.next_seq();
+        let last_log_id = if next_seq == 0 {
+            None
+        } else {
+            let mut reader = self
+                .store
+                .reader(next_seq - 1, false)
+                .map_err(seq_log_err)?;
+            if let Some(buf) = reader.next().map_err(seq_log_err)? {
+                let entry = C::Entry::decode(buf).map_err(new_other_err)?;
+                Some(entry.log_id())
+            } else {
+                None
+            }
+        };
+
+        Ok(LogState {
+            last_purged_log_id,
+            last_log_id,
+        })
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -271,6 +303,7 @@ where
             write_buf: Vec::new(),
             write_pos: Vec::new(),
             vote_path: path.join("VOTE"),
+            purged_log_id_path: path.join("PURGED_LOG_ID"),
             _p: PhantomData::default(),
         })
     }
