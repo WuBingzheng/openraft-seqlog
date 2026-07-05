@@ -52,11 +52,10 @@ where
 }
 
 pub trait EntryCodec: Sized + Send + OptionalSync + 'static {
-    type EncodeError;
-    type DecodeError: Send + Sync + 'static + std::error::Error;
+    type EncodeError: std::error::Error + Send + Sync + 'static;
+    type DecodeError: std::error::Error + Send + Sync + 'static;
 
     fn encode(&self, buf: &mut Vec<u8>) -> Result<(), Self::EncodeError>;
-
     fn decode(data: &[u8]) -> Result<Self, Self::DecodeError>;
 }
 
@@ -210,7 +209,7 @@ where
         // prepare
         let mut first_index = 0;
         for entry in entries.into_iter() {
-            let _ = entry.encode(&mut self.write_buf);
+            entry.encode(&mut self.write_buf).map_err(new_other_err)?;
             self.write_pos.push(self.write_buf.len());
 
             if first_index == 0 {
@@ -255,11 +254,11 @@ where
     ///   transaction, but it must not leave a **hole** in logs. In other words, a non-transactional
     ///   truncation removes log entries from the end backward to this `last_log_id`.
     async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<C>>) -> Result<(), io::Error> {
-        let index = match last_log_id {
-            Some(log_id) => log_id.index(),
-            None => 0,
-        };
-        self.store.truncate(index).map_err(seq_log_err)
+        match last_log_id {
+            Some(log_id) => self.store.truncate(log_id.index() + 1),
+            None => self.store.reset(0),
+        }
+        .map_err(seq_log_err)
     }
 
     /// Purge logs up to `log_id`, inclusive
@@ -268,7 +267,13 @@ where
     ///
     /// - It must not leave a **hole** in logs.
     async fn purge(&mut self, log_id: LogIdOf<C>) -> Result<(), io::Error> {
-        self.store.purge(log_id.index()).map_err(seq_log_err)
+        self.store.purge(log_id.index() + 1).map_err(seq_log_err)?;
+
+        // save to file
+        let json_value = serde_json::to_vec(&log_id).map_err(new_other_err)?;
+        let mut file = File::create(&self.purged_log_id_path)?;
+        file.write(&json_value)?;
+        file.sync_all()
     }
 }
 
